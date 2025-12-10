@@ -1,4 +1,21 @@
 # Copyright (c) 2023, Tri Dao.
+"""
+FlashAttention Interface Module
+
+This module provides the main Python interface for FlashAttention, a fast and memory-efficient
+exact attention algorithm. FlashAttention uses tiling and recomputation to reduce memory
+usage from O(N²) to O(N) where N is sequence length, while maintaining exact attention scores.
+
+Key features:
+- Memory-efficient: O(N) memory usage instead of O(N²)
+- Fast: 2-4x faster than standard attention on modern GPUs
+- Exact: Produces the same results as standard attention
+- Supports: causal masking, sliding window, variable length sequences, MQA/GQA, dropout
+
+The module supports two backends:
+1. CUDA backend (default): Optimized CUDA/C++ kernels for NVIDIA GPUs
+2. Triton ROCm backend: Triton-based kernels for AMD GPUs (experimental)
+"""
 
 from typing import Optional, Sequence, Tuple, Union
 
@@ -8,25 +25,62 @@ import os
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
+# Check if AMD ROCm backend is requested via environment variable
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 if USE_TRITON_ROCM:
+    # Use Triton-based implementation for AMD GPUs
     from .flash_attn_triton_amd import interface_fa as flash_attn_gpu
 else:
+    # Use native CUDA implementation for NVIDIA GPUs (default)
     import flash_attn_2_cuda as flash_attn_gpu
 
 # isort: on
 
 def maybe_contiguous(x):
+    """
+    Ensure tensor is contiguous if needed for kernel execution.
+
+    FlashAttention kernels require the last dimension to be contiguous (stride=1)
+    for efficient memory access patterns. This function only copies if necessary.
+
+    Args:
+        x: Input tensor or None
+
+    Returns:
+        Contiguous tensor if x is not None and last stride != 1, otherwise x unchanged
+    """
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
-    # This should match the block sizes in the CUDA kernel
+    """
+    Determine the optimal block size for the KV (key/value) dimension based on GPU architecture.
+
+    The block size affects shared memory usage and register pressure. Different GPU architectures
+    and configurations require different block sizes for optimal performance.
+
+    Architecture notes:
+    - SM80 (A100): More conservative block sizes due to shared memory constraints
+    - SM8x (RTX 30xx, A10, etc.): Can use larger blocks with causal attention
+    - SM90 (H100): Improved shared memory allows larger blocks
+
+    Args:
+        device: CUDA device to query for compute capability
+        head_dim: Dimension of each attention head
+        is_dropout: Whether dropout is enabled (requires storing attention matrix)
+        is_causal: Whether using causal masking (can use larger blocks)
+
+    Returns:
+        int: Block size for the KV sequence dimension (typically 32, 64, or 128)
+    """
+    # This should match the block sizes in the CUDA kernel instantiations
     assert head_dim <= 256
     major, minor = torch.cuda.get_device_capability(device)
     is_sm8x = major == 8 and minor > 0  # Only include sm86 and sm89, exclude sm80 (A100)
     is_sm80 = major == 8 and minor == 0
     is_sm90 = major == 9 and minor == 0
+
+    # Smaller head dims can use larger blocks (less register pressure)
     if head_dim <= 32:
         return 128
     if head_dim <= 64:
@@ -34,6 +88,7 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     elif head_dim <= 96:
         return 64
     elif head_dim <= 128:
+        # SM8x can use larger blocks for causal attention without dropout
         if is_sm8x:
             return 64 if (not is_dropout and is_causal) else 32
         else:
@@ -47,28 +102,54 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
 
 
 def round_multiple(x, m):
+    """
+    Round x up to the nearest multiple of m.
+
+    Used for padding sequence lengths to match CUDA kernel tile sizes.
+
+    Args:
+        x: Value to round
+        m: Multiple to round to
+
+    Returns:
+        Smallest value >= x that is divisible by m
+    """
     return (x + m - 1) // m * m
 
 
-# torch.compile() support is only enabled for pytorch >= 2.4
-# The reason for this is that we are using the new custom_op and register_fake
-# APIs, which support inplace modification of inputs in the function itself
+# ============================================================================
+# torch.compile() Support (PyTorch >= 2.4)
+# ============================================================================
+# FlashAttention supports torch.compile() for JIT compilation and graph optimization.
+# This requires PyTorch >= 2.4 which provides the custom_op and register_fake APIs.
+#
+# The custom_op API allows defining custom CUDA operators that torch.compile can handle.
+# The register_fake API provides shape/dtype inference without executing the kernel,
+# enabling graph analysis and optimization passes.
+#
+# For PyTorch < 2.4, we use no-op wrappers that simply return the function unchanged.
+# The kernels will still work, but without torch.compile integration.
 if torch.__version__ >= "2.4.0":
     _torch_custom_op_wrapper = torch.library.custom_op
     _torch_register_fake_wrapper = torch.library.register_fake
 else:
+    # No-op wrappers for PyTorch < 2.4 (no torch.compile support)
     def noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
+        """No-op wrapper that returns function unchanged."""
         def wrap(func):
             return func
         if fn is None:
             return wrap
         return fn
+
     def noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
+        """No-op wrapper that returns function unchanged."""
         def wrap(func):
             return func
         if fn is None:
             return wrap
         return fn
+
     _torch_custom_op_wrapper = noop_custom_op_wrapper
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
